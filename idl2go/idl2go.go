@@ -18,6 +18,7 @@ func main() {
 	var quiet bool
 	var tostdout bool
 	var fromstdin bool
+	var includeContextFlag string
 
 	flag.StringVar(&outdir, "d", ".", "Base directory to write generated .go files to")
 	flag.StringVar(&defaultPkgName, "p", "", "Package name to write to generated Go file")
@@ -26,6 +27,7 @@ func main() {
 	flag.BoolVar(&quiet, "q", false, "Enable quiet mode (no output)")
 	flag.BoolVar(&tostdout, "s", false, "Write .go file to STDOUT (implies -q)")
 	flag.BoolVar(&fromstdin, "i", false, "Read IDL JSON from STDIN")
+	flag.StringVar(&includeContextFlag, "context", "no", `Whether to add a "context".Context parameter to methods. Valid values: "no"; "yes"; "both", which will create two interfaces`)
 	flag.Parse()
 
 	if !fromstdin && flag.NArg() != 1 {
@@ -57,6 +59,19 @@ func main() {
 		}
 	}
 
+	var includeContext barrister.IncludeContext
+	switch includeContextFlag {
+	case "yes":
+		includeContext = barrister.IncludeContextYes
+	case "no":
+		includeContext = barrister.IncludeContextNo
+	case "both":
+		includeContext = barrister.IncludeContextBoth
+	default:
+		fmt.Fprintf(os.Stderr, `Invalid value %q for flag "context". Valid values: "yes", "no", "both".`+"\n", includeContextFlag)
+		os.Exit(1)
+	}
+
 	idl, err := parseIdl(fromstdin, jsonFile)
 	if err != nil {
 		from := jsonFile
@@ -67,7 +82,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	pkgNameToGoCode := idl.GenerateGo(defaultPkgName, baseImport, optionalToPtr)
+	pkgNameToGoCode := idl.GenerateGo(defaultPkgName, baseImport, optionalToPtr, includeContext)
 	for pkg, code := range pkgNameToGoCode {
 		writeCode(quiet, tostdout, outdir, pkg, code)
 	}

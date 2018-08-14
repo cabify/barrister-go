@@ -74,7 +74,7 @@ func createTestIdl() *Idl {
 func TestIdl2Go(t *testing.T) {
 	idl := parseTestIdl()
 
-	pkgNameToCode := idl.GenerateGo("conform", "", true)
+	pkgNameToCode := idl.GenerateGo("conform", "", true, IncludeContextNo)
 	err := os.MkdirAll("conform/generated", 0755)
 	if err != nil {
 		t.Error(err)

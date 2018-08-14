@@ -2,6 +2,7 @@ package barrister
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -329,6 +330,18 @@ func (idl *Idl) computeStructFields(toAdd *Struct, allFields []Field) []Field {
 	return allFields
 }
 
+// IncludeContext is an option type for Idl.GenerateGo.
+type IncludeContext string
+
+const (
+	// IncludeContextYes enables a first "net/context".Context argument in generated methods.
+	IncludeContextYes IncludeContext = "yes"
+	// IncludeContextNo disables a first "net/context".Context argument in generated methods.
+	IncludeContextNo IncludeContext = "no"
+	// IncludeContextBoth generates two interfaces, one of them with a first "net/context".Context argument in each method.
+	IncludeContextBoth IncludeContext = "both"
+)
+
 // GenerateGo generates Go source code for the given Idl.  A map is returned whose keys are
 // the Go package names and values are the source code for that package.
 //
@@ -346,13 +359,18 @@ func (idl *Idl) computeStructFields(toAdd *Struct, allFields []Field) []Field {
 // behavior of `encoding/json`, all nested struct fields marked optional will be generated as
 // pointers.  Otherwise there is no way to omit those fields from the struct during marshaling.
 //
-func (idl *Idl) GenerateGo(defaultPkgName string, baseImport string, optionalToPtr bool) map[string][]byte {
+// includeContext - If "yes", methods will have a first argument "net/context".Context.
+// If "no", they won't. If "both", two interfaces will be generated, one
+// with a Context argument and another without.
+//
+func (idl *Idl) GenerateGo(defaultPkgName string, baseImport string, optionalToPtr bool, includeContext IncludeContext) map[string][]byte {
 	pkgNameToGoCode := make(map[string][]byte)
 	for _, nsIdl := range partitionIdlByNamespace(idl, defaultPkgName) {
 		g := generateGo{idl,
 			nsIdl.idl,
 			nsIdl.pkgName,
 			optionalToPtr,
+			includeContext,
 			nsIdl.imports,
 			baseImport}
 		pkgNameToGoCode[nsIdl.pkgName] = g.generate()
@@ -660,6 +678,12 @@ type Transport interface {
 	Send(in []byte) ([]byte, error)
 }
 
+// TransportContext extends Transport with context support.
+type TransportContext interface {
+	Transport
+	SendContext(ctx context.Context, in []byte) ([]byte, error)
+}
+
 // HttpTransport sends requests via the Go `http` package
 type HttpTransport struct {
 	// Endpoint of JSON-RPC service to consume
@@ -690,11 +714,15 @@ type HttpHook interface {
 }
 
 func (t *HttpTransport) Send(in []byte) ([]byte, error) {
+	return t.SendContext(context.Background(), in)
+}
 
+func (t *HttpTransport) SendContext(ctx context.Context, in []byte) ([]byte, error) {
 	req, err := http.NewRequest("POST", t.Url, bytes.NewBuffer(in))
 	if err != nil {
 		return nil, fmt.Errorf("barrister: HttpTransport NewRequest failed: %s", err)
 	}
+	req = req.WithContext(ctx)
 
 	// TODO: need to make mime type plugable
 	req.Header.Add("Content-Type", "application/json")
@@ -744,18 +772,44 @@ type Client interface {
 	CallBatch(batch []JsonRpcRequest) []JsonRpcResponse
 }
 
+// ClientContext extends Client with context parameters.
+type ClientContext interface {
+	Client
+	// CallContext extends Client.Call with a context parameter.
+	CallContext(ctx context.Context, method string, params ...interface{}) (interface{}, error)
+	// CallBatchContext extends Client.CallBatch with a context parameter.
+	CallBatchContext(ctx context.Context, batch []JsonRpcRequest) []JsonRpcResponse
+}
+
 // NewRemoteClient creates a RemoteClient with the given Transport using the JsonSerializer
 func NewRemoteClient(trans Transport, forceASCII bool) Client {
+	return &RemoteClient{transportIgnoreContext{trans}, &JsonSerializer{forceASCII}}
+}
+
+type transportIgnoreContext struct {
+	Transport
+}
+
+func (t transportIgnoreContext) SendContext(ctx context.Context, in []byte) ([]byte, error) {
+	return t.Send(in)
+}
+
+// NewRemoteClientContext creates a RemoteClient with the given TransportContext using the JsonSerializer
+func NewRemoteClientContext(trans TransportContext, forceASCII bool) ClientContext {
 	return &RemoteClient{trans, &JsonSerializer{forceASCII}}
 }
 
 // RemoteClient implements Client against the given Transport and Serializer.
 type RemoteClient struct {
-	Trans Transport
+	Trans TransportContext
 	Ser   Serializer
 }
 
 func (c *RemoteClient) CallBatch(batch []JsonRpcRequest) []JsonRpcResponse {
+	return c.CallBatchContext(context.Background(), batch)
+}
+
+func (c *RemoteClient) CallBatchContext(ctx context.Context, batch []JsonRpcRequest) []JsonRpcResponse {
 	reqBytes, err := c.Ser.Marshal(batch)
 	if err != nil {
 		msg := fmt.Sprintf("barrister: CallBatch unable to Marshal request: %s", err)
@@ -763,7 +817,7 @@ func (c *RemoteClient) CallBatch(batch []JsonRpcRequest) []JsonRpcResponse {
 			JsonRpcResponse{Error: &JsonRpcError{Code: -32600, Message: msg}}}
 	}
 
-	respBytes, err := c.Trans.Send(reqBytes)
+	respBytes, err := c.Trans.SendContext(ctx, reqBytes)
 	if err != nil {
 		msg := fmt.Sprintf("barrister: CallBatch Transport error during request: %s", err)
 		return []JsonRpcResponse{
@@ -782,6 +836,10 @@ func (c *RemoteClient) CallBatch(batch []JsonRpcRequest) []JsonRpcResponse {
 }
 
 func (c *RemoteClient) Call(method string, params ...interface{}) (interface{}, error) {
+	return c.CallContext(context.Background(), method, params...)
+}
+
+func (c *RemoteClient) CallContext(ctx context.Context, method string, params ...interface{}) (interface{}, error) {
 	rpcReq := JsonRpcRequest{Jsonrpc: "2.0", Id: randHex(20), Method: method, Params: params}
 
 	reqBytes, err := c.Ser.Marshal(rpcReq)
@@ -790,7 +848,7 @@ func (c *RemoteClient) Call(method string, params ...interface{}) (interface{}, 
 		return nil, &JsonRpcError{Code: -32600, Message: msg}
 	}
 
-	respBytes, err := c.Trans.Send(reqBytes)
+	respBytes, err := c.Trans.SendContext(ctx, reqBytes)
 	if err != nil {
 		msg := fmt.Sprintf("barrister: %s: Transport error during request: %s", method, err)
 		return nil, &JsonRpcError{Code: -32603, Message: msg}
@@ -955,6 +1013,13 @@ func (s *Server) AddFilter(f Filter) {
 	s.filters = append(s.filters, f)
 }
 
+var typeOfError = reflect.TypeOf((*error)(nil)).Elem()
+var typeOfContext = reflect.TypeOf((*context.Context)(nil)).Elem()
+
+func firstIsContext(fnType reflect.Type) bool {
+	return fnType.NumIn() > 0 && fnType.In(0) == typeOfContext
+}
+
 // AddHandler associates the given impl with the IDL interface.
 // Typically this method is used with idl2go generated interfaces, so
 // any validation issues indicate a programming bug.  Consequently this
@@ -968,8 +1033,6 @@ func (s *Server) AddHandler(iface string, impl interface{}) {
 		panic(msg)
 	}
 
-	var typeOfError = reflect.TypeOf((*error)(nil)).Elem()
-
 	elem := reflect.ValueOf(impl)
 	for _, idlFunc := range ifaceFuncs {
 		fname := capitalize(idlFunc.Name)
@@ -981,7 +1044,13 @@ func (s *Server) AddHandler(iface string, impl interface{}) {
 		}
 
 		fnType := fn.Type()
-		if fnType.NumIn() != len(idlFunc.Params) {
+		firstCtx := firstIsContext(fnType)
+
+		expectedIn := len(idlFunc.Params)
+		if firstCtx {
+			expectedIn++
+		}
+		if fnType.NumIn() != expectedIn {
 			msg := fmt.Sprintf("barrister: %s impl method: %s accepts %d params but IDL specifies %d", iface, fname, fnType.NumIn(), len(idlFunc.Params))
 			panic(msg)
 		}
@@ -992,6 +1061,9 @@ func (s *Server) AddHandler(iface string, impl interface{}) {
 		}
 
 		for x, param := range idlFunc.Params {
+			if firstCtx {
+				x++
+			}
 			path := fmt.Sprintf("%s.%s param[%d]", iface, fname, x)
 			s.validate(param, fnType.In(x), path)
 		}
@@ -1031,7 +1103,11 @@ func (s *Server) validate(idlField Field, implType reflect.Type, path string) {
 // InvokeBytess delegates to InvokeOne and then marshals the result using the
 // Serializer and returns the serialized byte slice.
 func (s *Server) InvokeBytes(headers Headers, req []byte) []byte {
+	return s.InvokeBytesContext(context.Background(), headers, req)
+}
 
+// InvokeBytesContext is like InvokeBytes, taking also a context parameter.
+func (s *Server) InvokeBytesContext(ctx context.Context, headers Headers, req []byte) []byte {
 	// determine if batch or single
 	batch := s.ser.IsBatch(req)
 
@@ -1063,7 +1139,7 @@ func (s *Server) InvokeBytes(headers Headers, req []byte) []byte {
 		return jsonParseErr("", false, err)
 	}
 
-	resp := s.InvokeOne(headers, &rpcReq)
+	resp := s.InvokeOneContext(ctx, headers, &rpcReq)
 
 	b, err := s.ser.Marshal(resp)
 	if err != nil {
@@ -1075,6 +1151,11 @@ func (s *Server) InvokeBytes(headers Headers, req []byte) []byte {
 // InvokeOne handles a single JSON-RPC request, delegating to Call.  If the special "barrister-idl"
 // method is handled, InvokeOne will return the IDL associated with this Server.
 func (s *Server) InvokeOne(headers Headers, rpcReq *JsonRpcRequest) *JsonRpcResponse {
+	return s.InvokeOneContext(context.Background(), headers, rpcReq)
+}
+
+// InvokeOneContext is like InvokeOne, taking also a context parameter.
+func (s *Server) InvokeOneContext(ctx context.Context, headers Headers, rpcReq *JsonRpcRequest) *JsonRpcResponse {
 	if rpcReq.Method == "barrister-idl" {
 		// handle 'barrister-idl' method
 		return &JsonRpcResponse{Jsonrpc: "2.0", Id: rpcReq.Id, Result: s.idl.elems}
@@ -1085,9 +1166,9 @@ func (s *Server) InvokeOne(headers Headers, rpcReq *JsonRpcRequest) *JsonRpcResp
 	var err error
 	arr, ok := rpcReq.Params.([]interface{})
 	if ok {
-		result, err = s.Call(headers, rpcReq.Method, arr...)
+		result, err = s.CallContext(ctx, headers, rpcReq.Method, arr...)
 	} else {
-		result, err = s.Call(headers, rpcReq.Method)
+		result, err = s.CallContext(ctx, headers, rpcReq.Method)
 	}
 
 	if err == nil {
@@ -1103,10 +1184,15 @@ func (s *Server) InvokeOne(headers Headers, rpcReq *JsonRpcRequest) *JsonRpcResp
 // batch will match the order of the requests.
 //
 func (s *Server) CallBatch(headers Headers, batch []JsonRpcRequest) []JsonRpcResponse {
+	return s.CallBatchContext(context.Background(), headers, batch)
+}
+
+// CallBatchContext is like CallBatch, taking also a context parameter.
+func (s *Server) CallBatchContext(ctx context.Context, headers Headers, batch []JsonRpcRequest) []JsonRpcResponse {
 	batchResp := make([]JsonRpcResponse, len(batch))
 
 	for _, req := range batch {
-		result, err := s.Call(headers, req.Method, req.Params)
+		result, err := s.CallContext(ctx, headers, req.Method, req.Params)
 		resp := JsonRpcResponse{Jsonrpc: "2.0", Id: req.Id}
 		if err == nil {
 			resp.Result = result
@@ -1142,6 +1228,11 @@ func (s *Server) CallBatch(headers Headers, batch []JsonRpcRequest) []JsonRpcRes
 // 8) The result/error is returned
 //
 func (s *Server) Call(headers Headers, method string, params ...interface{}) (interface{}, error) {
+	return s.CallContext(context.Background(), headers, method, params...)
+}
+
+// CallContext is like Call, taking also a context parameter.
+func (s *Server) CallContext(ctx context.Context, headers Headers, method string, params ...interface{}) (interface{}, error) {
 
 	idlFunc, ok := s.idl.methods[method]
 	if !ok {
@@ -1173,9 +1264,15 @@ func (s *Server) Call(headers Headers, method string, params ...interface{}) (in
 
 	// check params
 	fnType := fn.Type()
-	if fnType.NumIn() != len(params) {
+
+	expectedIn := len(params)
+	firstCtx := firstIsContext(fnType)
+	if firstCtx {
+		expectedIn++
+	}
+	if fnType.NumIn() != expectedIn {
 		return nil, &JsonRpcError{Code: -32602,
-			Message: fmt.Sprintf("Method %s expects %d params but was passed %d", method, fnType.NumIn(), len(params))}
+			Message: fmt.Sprintf("Method %s expects %d params but was passed %d", method, fnType.NumIn(), expectedIn)}
 	}
 
 	if len(idlFunc.Params) != len(params) {
@@ -1197,7 +1294,11 @@ func (s *Server) Call(headers Headers, method string, params ...interface{}) (in
 	// convert params
 	paramVals := []reflect.Value{}
 	for x, param := range params {
-		desiredType := fnType.In(x)
+		arg := x
+		if firstCtx {
+			arg++
+		}
+		desiredType := fnType.In(arg)
 		idlField := idlFunc.Params[x]
 		path := fmt.Sprintf("param[%d]", x)
 		paramConv := newConvert(s.idl, &idlField, desiredType, param, path)
@@ -1206,6 +1307,9 @@ func (s *Server) Call(headers Headers, method string, params ...interface{}) (in
 			return nil, &JsonRpcError{Code: -32602, Message: err.Error()}
 		}
 		paramVals = append(paramVals, converted)
+	}
+	if firstCtx {
+		paramVals = append([]reflect.Value{reflect.ValueOf(ctx)}, paramVals...)
 	}
 
 	// make the call
@@ -1252,7 +1356,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		Response: make(map[string][]string),
 	}
 
-	resp := s.InvokeBytes(headers, buf.Bytes())
+	resp := s.InvokeBytesContext(req.Context(), headers, buf.Bytes())
 	w.Header().Set("Content-Type", s.ser.MimeType())
 
 	for k, v := range headers.Response {
