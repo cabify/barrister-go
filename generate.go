@@ -39,6 +39,11 @@ type generateGo struct {
 	// if false, "omitempty" will be added to the json tag
 	optionalToPtr bool
 
+	// If "yes", methods will have a first argument "context".Context.
+	// If "no", they won't. If "both", two interfaces will be generated, one
+	// with a Context argument and another without.
+	includeContext IncludeContext
+
 	// imports to add
 	imports []string
 
@@ -62,6 +67,9 @@ func (g *generateGo) generate() []byte {
 	}
 	for _, imp := range g.imports {
 		line(b, 1, fmt.Sprintf("\"%s%s\"", g.baseImport, imp))
+	}
+	if g.includeContext != IncludeContextNo && g.hasInterface() {
+		line(b, 1, `"context"`)
 	}
 	line(b, 0, ")\n")
 
@@ -89,12 +97,13 @@ func (g *generateGo) generate() []byte {
 
 	if g.hasInterface() {
 		for _, name := range sortedKeys(g.pkgIdl.interfaces) {
-			g.generateInterface(b, name)
-			line(b, 0, "}\n")
-			g.generateProxy(b, name)
+			g.generateInterfaceAndProxy(b, name)
 		}
 
-		g.generateNewServer(b)
+		g.generateNewServer(b, false)
+		if g.includeContext == IncludeContextBoth {
+			g.generateNewServer(b, true)
+		}
 		g.generateIdlJson(b)
 	}
 
@@ -145,66 +154,95 @@ func (g *generateGo) generateStruct(b *bytes.Buffer, s *Struct) {
 	line(b, 0, "}\n")
 }
 
-func (g *generateGo) generateNewServer(b *bytes.Buffer) {
+func (g *generateGo) generateNewServer(b *bytes.Buffer, withContextSuffix bool) {
 	ifaceKeys := sortedKeys(g.idl.interfaces)
-	ifaces := ""
-	ifaceIdents := ""
+	ifaces := make([]string, 0, len(ifaceKeys))
+	ifaceNames := make([]string, 0, len(ifaceKeys))
+	ifaceIdents := make([]string, 0, len(ifaceKeys))
 	for _, name := range ifaceKeys {
 		upper := capitalize(name)
 		lower := escReserved(strings.ToLower(name))
-		ifaces = fmt.Sprintf("%s, %s %s", ifaces, lower, upper)
-		ifaceIdents += ", " + lower
+		if withContextSuffix {
+			upper += withContextIfaceNameSuffix
+		}
+		ifaces = append(ifaces, fmt.Sprintf("%s %s", lower, upper))
+		ifaceNames = append(ifaceNames, upper)
+		ifaceIdents = append(ifaceIdents, lower)
 	}
-
-	line(b, 0, fmt.Sprintf("func NewJSONServer(idl *barrister.Idl, forceASCII bool%s) barrister.Server {", ifaces))
-	line(b, 1, fmt.Sprintf("return NewServer(idl, &barrister.JsonSerializer{forceASCII}%s)", ifaceIdents))
+	contextSuffix := ""
+	if withContextSuffix {
+		contextSuffix = withContextIfaceNameSuffix
+	}
+	line(b, 0, fmt.Sprintf("func NewJSONServer%s(idl *barrister.Idl, forceASCII bool, %s) barrister.Server {", contextSuffix, strings.Join(ifaces, ", ")))
+	line(b, 1, fmt.Sprintf("return NewServer%s(idl, &barrister.JsonSerializer{forceASCII}, %s)", contextSuffix, strings.Join(ifaceIdents, ", ")))
 	line(b, 0, "}\n")
 
-	line(b, 0, fmt.Sprintf("func NewServer(idl *barrister.Idl, ser barrister.Serializer%s) barrister.Server {", ifaces))
+	line(b, 0, fmt.Sprintf("func NewServer%s(idl *barrister.Idl, ser barrister.Serializer, %s) barrister.Server {", contextSuffix, strings.Join(ifaces, ", ")))
 	line(b, 1, fmt.Sprintf("_svr := barrister.NewServer(idl, ser)"))
-	for _, name := range ifaceKeys {
-		lower := strings.ToLower(name)
-		line(b, 1, fmt.Sprintf("_svr.AddHandler(\"%s\", %s)", name, lower))
+	for i, name := range ifaceNames {
+		line(b, 1, fmt.Sprintf("_svr.AddHandler(\"%s\", %s)", name, ifaceIdents[i]))
 	}
 	line(b, 1, "return _svr")
 	line(b, 0, "}")
 }
 
-func (g *generateGo) generateInterface(b *bytes.Buffer, ifaceName string) {
+const withContextIfaceNameSuffix = "WithContext"
+
+func (g *generateGo) generateInterfaceAndProxy(b *bytes.Buffer, ifaceName string) {
 	funcs, ok := g.idl.interfaces[ifaceName]
 	if !ok {
 		panic("No interface found: " + ifaceName)
 	}
 
+	includeContext := g.includeContext == IncludeContextYes
+	g.generateInterface(b, ifaceName, funcs, includeContext)
+	line(b, 0, "}\n")
+	g.generateProxy(b, ifaceName, funcs, includeContext)
+
+	if g.includeContext == IncludeContextBoth {
+		nameWithContext := ifaceName + withContextIfaceNameSuffix
+		g.generateInterface(b, nameWithContext, funcs, true)
+		line(b, 0, "}\n")
+		g.generateProxy(b, nameWithContext, funcs, true)
+	}
+}
+
+func (g *generateGo) generateInterface(b *bytes.Buffer, ifaceName string, funcs []Function, includeContext bool) {
 	goName := capitalize(ifaceName)
 	line(b, 0, fmt.Sprintf("type %s interface {", goName))
 	for _, fn := range funcs {
 		goName = capitalize(fn.Name)
-		params := ""
-		for x, p := range fn.Params {
-			if x > 0 {
-				params += ", "
-			}
-			params += fmt.Sprintf("%s %s", escReserved(p.Name), p.goType(g.idl, g.optionalToPtr, g.pkgName))
+
+		numParams := len(fn.Params)
+		if includeContext {
+			numParams++
 		}
+		params := make([]string, 0, numParams)
+		if includeContext {
+			params = append(params, "ctx context.Context")
+		}
+		for _, p := range fn.Params {
+			params = append(params, fmt.Sprintf("%s %s", escReserved(p.Name), p.goType(g.idl, g.optionalToPtr, g.pkgName)))
+		}
+
 		line(b, 1, fmt.Sprintf("%s(%s) (%s, error)",
-			goName, params, fn.Returns.goType(g.idl, g.optionalToPtr, g.pkgName)))
+			goName, strings.Join(params, ", "), fn.Returns.goType(g.idl, g.optionalToPtr, g.pkgName)))
 	}
 }
 
-func (g *generateGo) generateProxy(b *bytes.Buffer, ifaceName string) {
-	funcs, ok := g.idl.interfaces[ifaceName]
-	if !ok {
-		panic("No interface found: " + ifaceName)
-	}
-
+func (g *generateGo) generateProxy(b *bytes.Buffer, ifaceName string, funcs []Function, includeContext bool) {
 	goIfaceName := capitalize(ifaceName)
 	goName := goIfaceName + "Proxy"
 
-	line(b, 0, fmt.Sprintf("func New%s(c barrister.Client) %s { return %s{c, barrister.MustParseIdlJson([]byte(IdlJsonRaw))} }\n", goName, goIfaceName, goName))
+	contextSuffix := ""
+	if includeContext {
+		contextSuffix = "Context"
+	}
+
+	line(b, 0, fmt.Sprintf("func New%s(c barrister.Client%s) %s { return %s{c, barrister.MustParseIdlJson([]byte(IdlJsonRaw))} }\n", goName, contextSuffix, goIfaceName, goName))
 
 	line(b, 0, fmt.Sprintf("type %s struct {", goName))
-	line(b, 1, "client barrister.Client")
+	line(b, 1, "client barrister.Client"+contextSuffix)
 	line(b, 1, "idl    *barrister.Idl")
 	line(b, 0, "}\n")
 	for _, fn := range funcs {
@@ -212,21 +250,32 @@ func (g *generateGo) generateProxy(b *bytes.Buffer, ifaceName string) {
 		retType := fn.Returns.goType(g.idl, g.optionalToPtr, g.pkgName)
 		zeroVal := fn.Returns.zeroVal(g.idl, g.optionalToPtr, g.pkgName)
 		fnName := capitalize(fn.Name)
-		params := ""
-		paramIdents := ""
-		for x, p := range fn.Params {
-			if x > 0 {
-				params += ", "
-			}
-			ident := escReserved(p.Name)
-			params += fmt.Sprintf("%s %s", ident, p.goType(g.idl, g.optionalToPtr, g.pkgName))
-			paramIdents += ", "
-			paramIdents += ident
+
+		numParams := len(fn.Params)
+		if includeContext {
+			numParams++
 		}
+		params := make([]string, 0, numParams)
+		paramIdents := make([]string, 0, numParams)
+		if includeContext {
+			params = append(params, "ctx context.Context")
+		}
+		for _, p := range fn.Params {
+			ident := escReserved(p.Name)
+			params = append(params, fmt.Sprintf("%s %s", ident, p.goType(g.idl, g.optionalToPtr, g.pkgName)))
+			paramIdents = append(paramIdents, ident)
+		}
+
 		line(b, 0, fmt.Sprintf("func (_p %s) %s(%s) (%s, error) {",
-			goName, fnName, params, retType))
-		line(b, 1, fmt.Sprintf("_res, _err := _p.client.Call(\"%s\"%s)",
-			method, paramIdents))
+			goName, fnName, strings.Join(params, ", "), retType))
+
+		contextArg := ""
+		if includeContext {
+			contextArg = "ctx, "
+		}
+
+		line(b, 1, fmt.Sprintf("_res, _err := _p.client.Call%s(%s\"%s\", %s)",
+			contextSuffix, contextArg, method, strings.Join(paramIdents, ", ")))
 		line(b, 1, "if _err == nil {")
 		if g.optionalToPtr && fn.Returns.Optional {
 			line(b, 2, "if _res == nil {")

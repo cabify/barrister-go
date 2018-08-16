@@ -1,5 +1,6 @@
 *~
 conform/server
+conform/server.go
 conform/generated
 client
 server
