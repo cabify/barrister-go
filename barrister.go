@@ -533,9 +533,12 @@ type JsonRpcResponse struct {
 //
 // This struct is used with the Filter interface and allows
 // Filter implementations to inspect the request, mutate the
-// handler (e.g. set out of band authentication information),
+// handler (e.g. set out of band authentication information)
+// and the context (e.g. to add tracing & logging information),
 // and set the result/error (e.g. to terminate an unauthorized request)
 type RequestResponse struct {
+	Context context.Context
+
 	// from Transport (e.g. HTTP headers)
 	Headers Headers
 
@@ -1280,7 +1283,13 @@ func (s *Server) CallContext(ctx context.Context, headers Headers, method string
 			Message: fmt.Sprintf("Method %s expects %d params but was passed %d", method, len(idlFunc.Params), len(params))}
 	}
 
-	rr := &RequestResponse{headers, method, params, handler, nil, nil}
+	rr := &RequestResponse{
+		Context: ctx,
+		Headers: headers,
+		Method: method,
+		Params: params,
+		Handler: handler,
+	}
 
 	// run filters - PreInvoke
 	flen := len(s.filters)
@@ -1309,7 +1318,7 @@ func (s *Server) CallContext(ctx context.Context, headers Headers, method string
 		paramVals = append(paramVals, converted)
 	}
 	if firstCtx {
-		paramVals = append([]reflect.Value{reflect.ValueOf(ctx)}, paramVals...)
+		paramVals = append([]reflect.Value{reflect.ValueOf(rr.Context)}, paramVals...)
 	}
 
 	// make the call

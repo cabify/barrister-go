@@ -1,6 +1,7 @@
 package barrister
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	. "github.com/couchbaselabs/go.assert"
@@ -8,6 +9,7 @@ import (
 	"math"
 	"reflect"
 	"testing"
+	"time"
 )
 
 // enums from conform.idl
@@ -163,6 +165,12 @@ type BImpl_BadReturn3 struct{}
 func (b BImpl_BadReturn3) Echo(s string) *string {
 	s2 := "blah"
 	return &s2
+}
+
+type CImpl func(ctx context.Context, param string) (*string, error)
+
+func (c CImpl) Echo(ctx context.Context, param string) (*string, error) {
+	return c(ctx, param)
 }
 
 type CallFail struct {
@@ -644,6 +652,38 @@ func TestFilterReturnErr(t *testing.T) {
 	}
 	if postCount != 0 {
 		t.Errorf("postCount != 0: %d", postCount)
+	}
+}
+
+func TestFilterModifiesContext(t *testing.T) {
+	var callDeadline time.Time
+	idl := parseTestIdl()
+	svr := NewJSONServer(idl, true)
+	svr.AddHandler("B", CImpl(func(ctx context.Context, s string) (*string, error) {
+		callDeadline, _ = ctx.Deadline()
+		return &s, nil
+	}))
+
+	tomorrow := time.Now().Add(24 * time.Hour)
+
+	var cancel func()
+	pre := func(r *RequestResponse) bool {
+		r.Context, cancel = context.WithDeadline(r.Context, tomorrow)
+		return true
+	}
+
+	post := func(r *RequestResponse) bool {
+		cancel()
+		return true
+	}
+
+	svr.AddFilter(ProxyFilter{pre, post})
+
+	headers := newHeaders()
+
+	resultOk(svr.Call(headers, "B.echo", "something"))
+	if callDeadline != tomorrow {
+		t.Errorf("deadline was not modified, callDeadline != tomorrow: %s != %s", callDeadline, tomorrow)
 	}
 }
 
